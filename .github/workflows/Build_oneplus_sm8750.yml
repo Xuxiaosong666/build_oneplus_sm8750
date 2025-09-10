@@ -52,9 +52,18 @@ on:
             - 'BBR'
          default: 'FQ_CODEL'
       
+      enable_kpm:
+        description: "启用KPM (Kernel Patch Manager)"
+        required: false
+        default: true
+        type: boolean
+
+      enable_lz4kd:
+        description: "启用LZ4KD压缩算法"
+        required: false
+        default: true
+        type: boolean
        
-
-
 jobs:
   build:
     name: Build_${{ github.event.inputs.REPO_MANIFEST }}
@@ -103,7 +112,13 @@ jobs:
               echo 'DEFAULT_SUFFIX=-android15-8-g29d86c5fc9dd-abogki428889875-4k' >> $GITHUB_ENV
               ;;
           esac
-          if [ "${{ github.event.inputs.keep_original_settings }}" = "false" ] && [ -n "${{ github.event.inputs.custom_kernel_suffix }}" ]; then
+          
+          # 设置KPM和LZ4KD环境变量
+          echo "ENABLE_KPM=${{ github.event.inputs.enable_kpm }}" >> $GITHUB_ENV
+          echo "ENABLE_LZ4KD=${{ github.event.inputs.enable_lz4kd }}" >> $GITHUB_ENV
+          
+          if [ "${{ github.event.inputs.keep_original_settings }}" = "false" ] && [ -n "${{ github.event.inputs.custom_kernel_time }}" ]; then
+            CUSTOM_TIME="${{ github.event.inputs.custom_kernel_time }}"
             echo "使用自定义构建时间: $CUSTOM_TIME"
             echo "KERNEL_TIME=$CUSTOM_TIME" >> $GITHUB_ENV
           else
@@ -248,10 +263,14 @@ jobs:
             cp ../susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
             
-            cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./common/include/linux
-            cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./common/lib
-            cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./common/crypto
-            cp -r ../SukiSU_patch/other/zram/lz4k_oplus ./common/lib/
+            # 根据是否启用LZ4KD添加相应文件
+            if [ "$ENABLE_LZ4KD" = "true" ]; then
+              cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./common/include/linux
+              cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./common/lib
+              cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./common/crypto
+              cp -r ../SukiSU_patch/other/zram/lz4k_oplus ./common/lib/
+            fi
+            
             if [ "$DEVICES_NAME" = "oneplus_ace5_ultra" ] || [ "${REPO_MANIFEST}" != "oneplus_13t" ]; then
             sed -i 's/^\(SUBLEVEL[[:space:]]*=[[:space:]]*\).*/\166/' ./common/Makefile
             fi
@@ -262,18 +281,20 @@ jobs:
             if [ "${DEVICES_NAME}" = "oneplus_ace5_ultra" ] || [ "${DEVICES_NAME}" = "realme_GT7" ]; then
               echo "跳过 LZ4 操作（匹配到 $DEVICES_NAME）"
             else
-                files=(
-                    "lib/lz4/lz4_compress.c"
-                    "lib/lz4/lz4_decompress.c"
-                    "lib/lz4/lz4defs.h"
-                    "lib/lz4/lz4hc_compress.c"
-                )
-                for file in "${files[@]}"; do
-                    if [ -e "$file" ]; then
-                        rm "$file"
-                    fi
-                done
-                ./main.bin "setup_lz4"
+                if [ "$ENABLE_LZ4KD" = "true" ]; then
+                  files=(
+                      "lib/lz4/lz4_compress.c"
+                      "lib/lz4/lz4_decompress.c"
+                      "lib/lz4/lz4defs.h"
+                      "lib/lz4/lz4hc_compress.c"
+                  )
+                  for file in "${files[@]}"; do
+                      if [ -e "$file" ]; then
+                          rm "$file"
+                      fi
+                  done
+                  ./main.bin "setup_lz4"
+                fi
             fi
             ./main.bin "SerialID_Check" "${{ github.event.inputs.custom_Serialid_suffix }}"
             rm -rf ./main.bin
@@ -318,12 +339,29 @@ jobs:
           
       - name: 🔧 Set gki_defconfig (设置编译配置)
         env:
-          ENABLE_B: ${{ github.event.inputs.enable_feature_b }}       
+          ENABLE_B: ${{ github.event.inputs.enable_feature_b }}
+          ENABLE_KPM: ${{ env.ENABLE_KPM }}
+          ENABLE_LZ4KD: ${{ env.ENABLE_LZ4KD }}
         run: |
           cd kernel_workspace/kernel_platform
           cp "${GITHUB_WORKSPACE}/.github/workflows/Bin/main.bin" ./
           chmod +x main.bin
           ./main.bin "setup_gki_config" "$ENABLE_B"
+          
+          # 添加KPM配置
+          if [ "$ENABLE_KPM" = "true" ]; then
+            echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          
+          # 添加LZ4KD配置
+          if [ "$ENABLE_LZ4KD" = "true" ]; then
+            echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          
           rm -rf ./main.bin
           #Remove check_defconfig
           sudo sed -i 's/check_defconfig//' ./common/build.config.gki
@@ -376,6 +414,17 @@ jobs:
           cd kernel_workspace/kernel_platform/common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-O2  gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole LD=ld.lld HOSTLD=ld.lld O=out KCFLAGS+=-O2  Image
+       
+      - name: 🔧 Apply KPM patch (应用KPM补丁)
+        if: env.ENABLE_KPM == 'true'
+        run: |
+          cd kernel_workspace/kernel_platform/common/out/arch/arm64/boot
+          curl -sSLO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          rm -f Image
+          mv oImage Image
+          echo "KPM补丁应用完成"
        
       - name: 📦 Make AnyKernel3 (创建Anykernel3)
         run: |
